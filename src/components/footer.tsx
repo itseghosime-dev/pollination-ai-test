@@ -11,7 +11,7 @@ export function Footer() {
           <span>Built with</span>
           <span className="font-semibold text-stone-800">Pollinations AI</span>
           <span>&middot;</span>
-          <span>FLUX</span>
+          <span>Image &amp; Speech</span>
         </div>
       </div>
     </footer>

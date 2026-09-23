@@ -1,19 +1,19 @@
 # PicForge AI — Turn Words into Images
 
-**PicForge AI** is a polished, lightweight AI text-to-image web application built with Next.js, React, TypeScript, Tailwind CSS, and Pollinations.AI.
+**PicForge AI** is a polished, lightweight AI text-to-image web application built with Next.js, React, TypeScript, Tailwind CSS, Pollinations.AI, and the native browser Web Speech API.
 
-Users enter a natural-language description using text or voice input, listen to their prompts read aloud, choose an artistic style, and generate high-fidelity AI images powered by Pollinations.AI.
+Users enter a natural-language description using text or native speech-to-text, listen to prompts read aloud via speech synthesis, choose an artistic style, and generate high-fidelity AI images powered by Pollinations.AI.
 
 ---
 
 ## Features
 
 - **Prompt Studio**: Rich input interface with live character counting, keyboard shortcuts (`Ctrl+Enter` / `Cmd+Enter`), and sample prompts.
-- **Speech-to-Text Input**: Speak your prompt directly into the application using browser recording powered by the `openai/whisper-large-v3` transcription model.
-- **Text-to-Speech Read Aloud**: Listen to your prompt read aloud with natural speech audio powered by `tts-1` (`nova` voice).
+- **Native Speech-to-Text Input**: Speak your prompt directly into the application using the browser's native `SpeechRecognition` / `webkitSpeechRecognition` API (zero external API calls or quota consumption).
+- **Native Text-to-Speech Read Aloud**: Listen to your prompt read aloud with browser `SpeechSynthesis` and instant Stop controls.
 - **Style Customization**: Selectable styles including *Photorealistic*, *Cinematic*, *Illustration*, and *3D Render*.
 - **Interactive Output**: Full-resolution image canvas with instant download and one-click regeneration.
-- **Server-Side Security**: All AI generation, transcription, and speech requests are proxied server-side via Next.js API routes (`/api/generate`, `/api/transcribe`, `/api/speech`).
+- **Server-Side Proxy for Images**: Image generation requests are routed through `/api/generate` to protect client integrity and format base64 image responses.
 - **Polished UX**: Warm off-white minimal aesthetic, shimmer skeleton loaders, accessible controls, and inline error handling.
 
 ---
@@ -23,10 +23,8 @@ Users enter a natural-language description using text or voice input, listen to 
 - **Framework**: [Next.js](https://nextjs.org/) (App Router)
 - **Language**: [TypeScript](https://www.typescriptlang.org/)
 - **Styling**: [Tailwind CSS](https://tailwindcss.com/)
-- **AI Provider**: [Pollinations.AI](https://pollinations.ai/)
-  - **Image Generation Model**: `flux`
-  - **Speech Transcription Model**: `openai/whisper-large-v3`
-  - **Text-to-Speech Model**: `tts-1` (`nova` voice)
+- **Image Generation Provider**: [Pollinations.AI](https://pollinations.ai/) (`flux` model)
+- **Voice Capabilities**: Native Browser Web Speech API (`SpeechRecognition` & `SpeechSynthesis`)
 - **Icons**: [Lucide React](https://lucide.dev/)
 
 ---
@@ -38,24 +36,6 @@ Clone or navigate to the project directory and install dependencies:
 ```bash
 npm install
 ```
-
----
-
-## Environment Variables
-
-Pollinations.AI provides access without requiring an API key. For authenticated access or higher tier rates, configure `POLLINATIONS_API_KEY` in `.env.local`:
-
-```bash
-cp .env.example .env.local
-```
-
-Inside `.env.local`:
-
-```env
-POLLINATIONS_API_KEY=your_pollinations_api_key_here
-```
-
-> **Security Note**: `POLLINATIONS_API_KEY` is strictly accessed server-side and never exposed to the client browser.
 
 ---
 
@@ -73,39 +53,37 @@ Open your browser and navigate to:
 http://localhost:3000
 ```
 
+> **Note**: Pollinations.AI works out-of-the-box without requiring an API key. If you have an authenticated Pollinations API key, you can optionally set `POLLINATIONS_API_KEY=your_key` in `.env.local`.
+
 ---
 
-## How It Works
+## Architecture & Flows
 
-### 1. Speech-to-Text Input Flow
+### 1. Voice Input (Speech-to-Text)
 ```text
-Voice Recording (Browser MediaRecorder)
-  ↓ (POST multipart/form-data audio to /api/transcribe)
-Next.js Server API
-  ↓ (Forwards audio to Pollinations Whisper API: openai/whisper-large-v3)
-Transcribed Text
-  ↓ (Appends naturally to prompt textarea)
-Prompt Studio
+User speaks
+  ↓
+Browser SpeechRecognition (en-US)
+  ↓
+Text appended to prompt textarea (preserving existing text)
 ```
 
-### 2. Text-to-Speech Read Aloud Flow
+### 2. Read Aloud (Text-to-Speech)
 ```text
-Prompt Text
-  ↓ (POST { text: "..." } to /api/speech)
-Next.js Server API
-  ↓ (Requests TTS from Pollinations: tts-1 with nova voice)
-Audio Stream (audio/mpeg)
-  ↓ (Browser Audio API playback with Stop control)
-Audio Playback
+Prompt textarea
+  ↓
+Browser SpeechSynthesis (SpeechSynthesisUtterance)
+  ↓
+Audio plays natively in browser
 ```
 
-### 3. Image Generation Flow
+### 3. Image Generation
 ```text
-Prompt & Selected Style
-  ↓ (POST { prompt: "...", style: "..." } to /api/generate)
+User prompt + Style
+  ↓ (POST /api/generate)
 Next.js Server API
-  ↓ (Appends style modifier & requests FLUX image with random seed)
-Pollinations.AI (flux model)
+  ↓ (Requests image from Pollinations with model=flux)
+Pollinations.AI
   ↓ (Returns binary image stream converted to base64 data URL)
-Browser Result View (Renders image, supports Download & Regenerate)
+Browser Result Canvas (Displays image with Download & Regenerate)
 ```

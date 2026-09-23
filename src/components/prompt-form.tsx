@@ -9,7 +9,6 @@ import {
   Mic,
   Square,
   Volume2,
-  Loader2,
   AlertCircle,
 } from "lucide-react";
 import React, { useState, useRef, useEffect } from "react";
@@ -37,6 +36,30 @@ const EXAMPLE_PROMPTS = [
 
 const MAX_CHAR_COUNT = 500;
 
+// Type declarations for browser SpeechRecognition API
+interface SpeechRecognitionEvent extends Event {
+  results: SpeechRecognitionResultList;
+  resultIndex: number;
+}
+
+interface SpeechRecognitionErrorEvent extends Event {
+  error: string;
+  message?: string;
+}
+
+interface ISpeechRecognition extends EventTarget {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  start: () => void;
+  stop: () => void;
+  abort: () => void;
+  onresult: ((event: SpeechRecognitionEvent) => void) | null;
+  onerror: ((event: SpeechRecognitionErrorEvent) => void) | null;
+  onend: (() => void) | null;
+  onstart: (() => void) | null;
+}
+
 interface PromptFormProps {
   prompt: string;
   setPrompt: (value: string | ((prev: string) => string)) => void;
@@ -58,33 +81,36 @@ export function PromptForm({
   const isPromptEmpty = prompt.trim().length === 0;
   const isOverLimit = charCount > MAX_CHAR_COUNT;
 
-  // Speech-to-text states
-  const [isRecording, setIsRecording] = useState(false);
-  const [isTranscribing, setIsTranscribing] = useState(false);
+  // Browser speech recognition state
+  const [isListening, setIsListening] = useState(false);
+  const [interimText, setInterimText] = useState("");
   const [speechError, setSpeechError] = useState<string | null>(null);
 
-  // Text-to-speech states
-  const [isGeneratingSpeech, setIsGeneratingSpeech] = useState(false);
+  // Browser speech synthesis (read aloud) state
   const [isPlayingAudio, setIsPlayingAudio] = useState(false);
 
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
-  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
-  const currentObjectUrlRef = useRef<string | null>(null);
+  const recognitionRef = useRef<ISpeechRecognition | null>(null);
 
-  // Clean up audio on unmount
+  // Helper to obtain Web Speech constructor safely
+  const getSpeechRecognitionConstructor = (): (new () => ISpeechRecognition) | null => {
+    if (typeof window === "undefined") return null;
+    const win = window as unknown as {
+      SpeechRecognition?: new () => ISpeechRecognition;
+      webkitSpeechRecognition?: new () => ISpeechRecognition;
+    };
+    return win.SpeechRecognition || win.webkitSpeechRecognition || null;
+  };
+
+  // Cleanup on unmount
   useEffect(() => {
     return () => {
-      if (currentAudioRef.current) {
-        currentAudioRef.current.pause();
-        currentAudioRef.current = null;
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.abort();
+        } catch {}
       }
-      if (currentObjectUrlRef.current) {
-        URL.revokeObjectURL(currentObjectUrlRef.current);
-        currentObjectUrlRef.current = null;
-      }
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
-        mediaRecorderRef.current.stop();
+      if (typeof window !== "undefined" && "speechSynthesis" in window) {
+        window.speechSynthesis.cancel();
       }
     };
   }, []);
@@ -106,200 +132,141 @@ export function PromptForm({
   };
 
   // -------------------------------------------------------------
-  // Speech-to-Text handler
+  // Native Browser SpeechRecognition (Speech-to-Text)
   // -------------------------------------------------------------
-  const handleToggleRecording = async () => {
+  const handleToggleListening = () => {
     setSpeechError(null);
 
-    // Stop if currently recording
-    if (isRecording) {
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
-        mediaRecorderRef.current.stop();
-      }
-      setIsRecording(false);
+    // If currently listening, stop manually
+    if (isListening && recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch {}
+      setIsListening(false);
+      setInterimText("");
       return;
     }
 
-    // Check browser support
-    if (typeof window === "undefined" || !navigator.mediaDevices || !window.MediaRecorder) {
-      setSpeechError("Voice input is not supported in this browser.");
+    const SpeechRecognitionClass = getSpeechRecognitionConstructor();
+    if (!SpeechRecognitionClass) {
+      setSpeechError(
+        "Voice input isn't supported by this browser. You can still type your prompt."
+      );
       return;
     }
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recognition = new SpeechRecognitionClass();
+      recognition.continuous = false;
+      recognition.interimResults = true;
+      recognition.lang = "en-US";
 
-      // Determine supported MIME type
-      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-        ? "audio/webm;codecs=opus"
-        : MediaRecorder.isTypeSupported("audio/webm")
-        ? "audio/webm"
-        : MediaRecorder.isTypeSupported("audio/mp4")
-        ? "audio/mp4"
-        : "";
-
-      const mediaRecorder = mimeType
-        ? new MediaRecorder(stream, { mimeType })
-        : new MediaRecorder(stream);
-
-      mediaRecorderRef.current = mediaRecorder;
-      audioChunksRef.current = [];
-
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data && event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
-        }
+      recognition.onstart = () => {
+        setIsListening(true);
+        setSpeechError(null);
+        setInterimText("");
       };
 
-      mediaRecorder.onstop = async () => {
-        // Stop all tracks to release mic
-        stream.getTracks().forEach((track) => track.stop());
+      recognition.onresult = (event: SpeechRecognitionEvent) => {
+        let finalTranscript = "";
+        let currentInterim = "";
 
-        const audioBlob = new Blob(audioChunksRef.current, {
-          type: mediaRecorder.mimeType || "audio/webm",
-        });
-
-        if (audioBlob.size === 0) {
-          setSpeechError("Recording was empty. Please try speaking again.");
-          return;
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+          const item = event.results[i];
+          if (item.isFinal) {
+            finalTranscript += item[0].transcript;
+          } else {
+            currentInterim += item[0].transcript;
+          }
         }
 
-        setIsTranscribing(true);
-        try {
-          const formData = new FormData();
-          formData.append("file", audioBlob, "recording.webm");
+        if (currentInterim) {
+          setInterimText(currentInterim);
+        }
 
-          const response = await fetch("/api/transcribe", {
-            method: "POST",
-            body: formData,
+        if (finalTranscript) {
+          setPrompt((prevText) => {
+            const current = typeof prevText === "string" ? prevText.trim() : "";
+            const addition = finalTranscript.trim();
+            if (!current) return addition;
+            return `${current} ${addition}`;
           });
-
-          const data = await response.json().catch(() => null);
-
-          if (!response.ok || !data?.text) {
-            throw new Error(data?.error || "We couldn't transcribe that recording. Please try again.");
-          }
-
-          const transcribedText = data.text.trim();
-          if (transcribedText) {
-            setPrompt((prevText) => {
-              const current = typeof prevText === "string" ? prevText.trim() : "";
-              if (!current) return transcribedText;
-              return `${current} ${transcribedText}`;
-            });
-          }
-        } catch (err: unknown) {
-          const msg =
-            err instanceof Error
-              ? err.message
-              : "We couldn't transcribe that recording. Please try again.";
-          setSpeechError(msg);
-        } finally {
-          setIsTranscribing(false);
+          setInterimText("");
         }
       };
 
-      mediaRecorder.start();
-      setIsRecording(true);
+      recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+        setIsListening(false);
+        setInterimText("");
+
+        if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+          setSpeechError("Microphone access was denied.");
+        } else if (event.error === "no-speech") {
+          setSpeechError("I couldn't hear anything. Try speaking again.");
+        } else if (event.error === "audio-capture") {
+          setSpeechError("Microphone capture is unavailable.");
+        } else if (event.error !== "aborted") {
+          setSpeechError("Voice recognition error. Please try again.");
+        }
+      };
+
+      recognition.onend = () => {
+        setIsListening(false);
+        setInterimText("");
+      };
+
+      recognitionRef.current = recognition;
+      recognition.start();
     } catch (err: unknown) {
-      console.error("Microphone access error:", err);
-      const errorName = (err as { name?: string })?.name;
-      if (errorName === "NotAllowedError" || errorName === "PermissionDeniedError") {
-        setSpeechError("Microphone access was denied.");
-      } else if (errorName === "NotFoundError" || errorName === "DevicesNotFoundError") {
-        setSpeechError("No microphone found on your device.");
-      } else {
-        setSpeechError("Microphone error. Please try again.");
-      }
-      setIsRecording(false);
+      console.error("Speech recognition startup error:", err);
+      setSpeechError("Unable to start speech recognition. Please try again.");
+      setIsListening(false);
+      setInterimText("");
     }
   };
 
   // -------------------------------------------------------------
-  // Text-to-Speech handler
+  // Native Browser SpeechSynthesis (Text-to-Speech)
   // -------------------------------------------------------------
-  const handleToggleSpeech = async () => {
+  const handleToggleSpeech = () => {
     setSpeechError(null);
 
-    // If currently playing, stop it
-    if (isPlayingAudio && currentAudioRef.current) {
-      currentAudioRef.current.pause();
-      currentAudioRef.current = null;
-      if (currentObjectUrlRef.current) {
-        URL.revokeObjectURL(currentObjectUrlRef.current);
-        currentObjectUrlRef.current = null;
-      }
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+      setSpeechError("Text-to-speech is not supported in this browser.");
+      return;
+    }
+
+    // Stop current reading if playing
+    if (isPlayingAudio) {
+      window.speechSynthesis.cancel();
       setIsPlayingAudio(false);
       return;
     }
 
     if (isPromptEmpty) return;
 
-    setIsGeneratingSpeech(true);
+    window.speechSynthesis.cancel(); // Clear any queued utterances
 
-    try {
-      // Stop any existing playback
-      if (currentAudioRef.current) {
-        currentAudioRef.current.pause();
-        currentAudioRef.current = null;
-      }
-      if (currentObjectUrlRef.current) {
-        URL.revokeObjectURL(currentObjectUrlRef.current);
-        currentObjectUrlRef.current = null;
-      }
+    const utterance = new SpeechSynthesisUtterance(prompt.trim());
+    utterance.lang = "en-US";
+    utterance.rate = 1.0;
 
-      const response = await fetch("/api/speech", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          text: prompt.trim(),
-        }),
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => null);
-        throw new Error(errorData?.error || "Unable to generate speech audio. Please try again.");
-      }
-
-      const audioBlob = await response.blob();
-      const audioUrl = URL.createObjectURL(audioBlob);
-      currentObjectUrlRef.current = audioUrl;
-
-      const audio = new Audio(audioUrl);
-      currentAudioRef.current = audio;
-
-      audio.onended = () => {
-        setIsPlayingAudio(false);
-        if (currentObjectUrlRef.current) {
-          URL.revokeObjectURL(currentObjectUrlRef.current);
-          currentObjectUrlRef.current = null;
-        }
-        currentAudioRef.current = null;
-      };
-
-      audio.onerror = () => {
-        setIsPlayingAudio(false);
-        setSpeechError("Audio playback failed. Please try again.");
-        if (currentObjectUrlRef.current) {
-          URL.revokeObjectURL(currentObjectUrlRef.current);
-          currentObjectUrlRef.current = null;
-        }
-        currentAudioRef.current = null;
-      };
-
-      setIsGeneratingSpeech(false);
+    utterance.onstart = () => {
       setIsPlayingAudio(true);
-      await audio.play();
-    } catch (err: unknown) {
-      console.error("TTS playback error:", err);
-      const msg =
-        err instanceof Error ? err.message : "Unable to generate speech audio. Please try again.";
-      setSpeechError(msg);
-      setIsGeneratingSpeech(false);
+    };
+
+    utterance.onend = () => {
       setIsPlayingAudio(false);
-    }
+    };
+
+    utterance.onerror = (e) => {
+      setIsPlayingAudio(false);
+      if (e.error !== "canceled" && e.error !== "interrupted") {
+        setSpeechError("Speech playback error. Please try again.");
+      }
+    };
+
+    window.speechSynthesis.speak(utterance);
   };
 
   return (
@@ -329,39 +296,32 @@ export function PromptForm({
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
             onKeyDown={handleKeyDown}
-            disabled={isLoading || isTranscribing}
+            disabled={isLoading}
             rows={4}
             maxLength={MAX_CHAR_COUNT}
             placeholder="Describe the image you want to create..."
             className="w-full resize-none border-0 bg-transparent p-1 text-base text-stone-900 placeholder:text-stone-400 focus:outline-hidden focus:ring-0 disabled:cursor-not-allowed disabled:opacity-60 leading-relaxed"
           />
 
-          {/* Prompt Controls Bar: Speech-to-Text & Text-to-Speech */}
+          {/* Prompt Controls Bar: Native SpeechRecognition & SpeechSynthesis */}
           <div className="mt-2 flex flex-wrap items-center justify-between gap-2 border-t border-stone-100 pt-3">
             <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Speech controls">
-              {/* Microphone / Speech-to-Text Button */}
+              {/* Native SpeechRecognition Button */}
               <button
                 type="button"
-                aria-label="Speak your prompt"
-                disabled={isLoading || isTranscribing}
-                onClick={handleToggleRecording}
+                aria-label={isListening ? "Stop listening" : "Speak your prompt"}
+                disabled={isLoading}
+                onClick={handleToggleListening}
                 className={`inline-flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-medium transition-all cursor-pointer focus:outline-hidden focus-visible:ring-2 focus-visible:ring-amber-500 ${
-                  isRecording
+                  isListening
                     ? "bg-red-600 text-white shadow-xs animate-pulse"
-                    : isTranscribing
-                    ? "bg-stone-100 text-stone-500 cursor-wait"
                     : "bg-stone-100/90 text-stone-700 hover:bg-stone-200/80 hover:text-stone-900"
                 } disabled:opacity-50`}
               >
-                {isRecording ? (
+                {isListening ? (
                   <>
                     <Square className="h-3.5 w-3.5 fill-current" />
                     <span>Listening...</span>
-                  </>
-                ) : isTranscribing ? (
-                  <>
-                    <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-600" />
-                    <span>Transcribing...</span>
                   </>
                 ) : (
                   <>
@@ -371,26 +331,19 @@ export function PromptForm({
                 )}
               </button>
 
-              {/* Text-to-Speech Button */}
+              {/* Native SpeechSynthesis Button */}
               <button
                 type="button"
                 aria-label={isPlayingAudio ? "Stop reading prompt" : "Read prompt aloud"}
-                disabled={isPromptEmpty || isLoading || isRecording || isTranscribing || isGeneratingSpeech}
+                disabled={isPromptEmpty || isLoading || isListening}
                 onClick={handleToggleSpeech}
                 className={`inline-flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-medium transition-all cursor-pointer focus:outline-hidden focus-visible:ring-2 focus-visible:ring-amber-500 ${
                   isPlayingAudio
                     ? "bg-amber-600 text-white shadow-xs"
-                    : isGeneratingSpeech
-                    ? "bg-stone-100 text-stone-500 cursor-wait"
                     : "bg-stone-100/90 text-stone-700 hover:bg-stone-200/80 hover:text-stone-900"
                 } disabled:cursor-not-allowed disabled:opacity-50`}
               >
-                {isGeneratingSpeech ? (
-                  <>
-                    <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-600" />
-                    <span>Preparing voice...</span>
-                  </>
-                ) : isPlayingAudio ? (
+                {isPlayingAudio ? (
                   <>
                     <Square className="h-3.5 w-3.5 fill-current" />
                     <span>Stop</span>
@@ -413,6 +366,13 @@ export function PromptForm({
               {charCount}/{MAX_CHAR_COUNT}
             </span>
           </div>
+
+          {/* Interim speech recognition live preview */}
+          {isListening && interimText && (
+            <div className="mt-2 text-xs text-amber-800 italic animate-pulse">
+              Listening: {interimText}...
+            </div>
+          )}
 
           {/* Inline Speech Status/Error Banner */}
           {speechError && (
@@ -449,7 +409,7 @@ export function PromptForm({
               <button
                 key={example}
                 type="button"
-                disabled={isLoading || isRecording || isTranscribing}
+                disabled={isLoading || isListening}
                 onClick={() => setPrompt(example)}
                 className="rounded-full bg-stone-100/90 px-3 py-1 text-xs text-stone-600 transition-colors hover:bg-stone-200/80 hover:text-stone-900 disabled:opacity-50 cursor-pointer focus:outline-hidden focus-visible:ring-2 focus-visible:ring-amber-500 text-left"
               >
@@ -477,7 +437,7 @@ export function PromptForm({
                     type="button"
                     role="radio"
                     aria-checked={isSelected}
-                    disabled={isLoading || isRecording || isTranscribing}
+                    disabled={isLoading || isListening}
                     onClick={() => setStyle(s.id)}
                     className={`inline-flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-medium transition-all cursor-pointer focus:outline-hidden focus-visible:ring-2 focus-visible:ring-amber-500 ${
                       isSelected
@@ -496,7 +456,7 @@ export function PromptForm({
           <div className="sm:self-end">
             <button
               type="submit"
-              disabled={isPromptEmpty || isLoading || isOverLimit || isRecording || isTranscribing}
+              disabled={isPromptEmpty || isLoading || isOverLimit || isListening}
               className="w-full sm:w-auto inline-flex items-center justify-center gap-2 rounded-2xl bg-stone-900 px-6 py-3 text-sm font-semibold text-white shadow-sm transition-all hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:text-stone-500 cursor-pointer focus:outline-hidden focus-visible:ring-2 focus-visible:ring-amber-500 focus-visible:ring-offset-2"
             >
               <Sparkles

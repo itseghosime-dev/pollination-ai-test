@@ -11,7 +11,7 @@ import {
   Volume2,
   AlertCircle,
 } from "lucide-react";
-import React, { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect, useCallback } from "react";
 
 export type StyleOption = "Photorealistic" | "Cinematic" | "Illustration" | "3D Render";
 
@@ -89,25 +89,31 @@ export function PromptForm({
   // Browser speech synthesis (read aloud) state
   const [isPlayingAudio, setIsPlayingAudio] = useState(false);
 
+  // References for continuous recognition management
+  const isListeningRef = useRef<boolean>(false);
   const recognitionRef = useRef<ISpeechRecognition | null>(null);
+  const basePromptRef = useRef<string>("");
+  const accumulatedFinalTextRef = useRef<string>("");
 
   // Helper to obtain Web Speech constructor safely
-  const getSpeechRecognitionConstructor = (): (new () => ISpeechRecognition) | null => {
+  const getSpeechRecognitionConstructor = useCallback((): (new () => ISpeechRecognition) | null => {
     if (typeof window === "undefined") return null;
     const win = window as unknown as {
       SpeechRecognition?: new () => ISpeechRecognition;
       webkitSpeechRecognition?: new () => ISpeechRecognition;
     };
     return win.SpeechRecognition || win.webkitSpeechRecognition || null;
-  };
+  }, []);
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
+      isListeningRef.current = false;
       if (recognitionRef.current) {
         try {
           recognitionRef.current.abort();
         } catch {}
+        recognitionRef.current = null;
       }
       if (typeof window !== "undefined" && "speechSynthesis" in window) {
         window.speechSynthesis.cancel();
@@ -132,18 +138,30 @@ export function PromptForm({
   };
 
   // -------------------------------------------------------------
-  // Native Browser SpeechRecognition (Speech-to-Text)
+  // Continuous Native Browser SpeechRecognition (Speech-to-Text)
   // -------------------------------------------------------------
   const handleToggleListening = () => {
     setSpeechError(null);
 
-    // If currently listening, stop manually
-    if (isListening && recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch {}
+    // If currently listening, user explicitly stops it
+    if (isListeningRef.current) {
+      isListeningRef.current = false;
       setIsListening(false);
       setInterimText("");
+
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.stop();
+        } catch {}
+      }
+
+      // Merge complete accumulated transcript to prompt
+      const base = basePromptRef.current;
+      const accumulated = accumulatedFinalTextRef.current.trim();
+      if (accumulated) {
+        const full = base ? `${base} ${accumulated}` : accumulated;
+        setPrompt(full);
+      }
       return;
     }
 
@@ -156,72 +174,101 @@ export function PromptForm({
     }
 
     try {
+      // Store current text as base prompt so spoken sentences append non-destructively
+      basePromptRef.current = prompt.trim();
+      accumulatedFinalTextRef.current = "";
+      setInterimText("");
+      setSpeechError(null);
+
       const recognition = new SpeechRecognitionClass();
-      recognition.continuous = false;
+      recognition.continuous = true;
       recognition.interimResults = true;
       recognition.lang = "en-US";
 
       recognition.onstart = () => {
         setIsListening(true);
         setSpeechError(null);
-        setInterimText("");
       };
 
       recognition.onresult = (event: SpeechRecognitionEvent) => {
-        let finalTranscript = "";
-        let currentInterim = "";
+        let interim = "";
+        let newFinalText = "";
 
-        for (let i = event.resultIndex; i < event.results.length; ++i) {
+        for (let i = event.resultIndex; i < event.results.length; i++) {
           const item = event.results[i];
+          const transcript = item[0].transcript;
+
           if (item.isFinal) {
-            finalTranscript += item[0].transcript;
+            newFinalText += transcript + " ";
           } else {
-            currentInterim += item[0].transcript;
+            interim += transcript;
           }
         }
 
-        if (currentInterim) {
-          setInterimText(currentInterim);
+        if (newFinalText) {
+          accumulatedFinalTextRef.current = (
+            accumulatedFinalTextRef.current + " " + newFinalText
+          )
+            .trim()
+            .replace(/\s+/g, " ");
+
+          const base = basePromptRef.current;
+          const full = base
+            ? `${base} ${accumulatedFinalTextRef.current}`
+            : accumulatedFinalTextRef.current;
+          setPrompt(full);
         }
 
-        if (finalTranscript) {
-          setPrompt((prevText) => {
-            const current = typeof prevText === "string" ? prevText.trim() : "";
-            const addition = finalTranscript.trim();
-            if (!current) return addition;
-            return `${current} ${addition}`;
-          });
-          setInterimText("");
-        }
+        setInterimText(interim.trim());
       };
 
       recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
-        setIsListening(false);
-        setInterimText("");
-
         if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+          isListeningRef.current = false;
+          setIsListening(false);
+          setInterimText("");
           setSpeechError("Microphone access was denied.");
-        } else if (event.error === "no-speech") {
-          setSpeechError("I couldn't hear anything. Try speaking again.");
         } else if (event.error === "audio-capture") {
+          isListeningRef.current = false;
+          setIsListening(false);
+          setInterimText("");
           setSpeechError("Microphone capture is unavailable.");
+        } else if (event.error === "no-speech") {
+          // In continuous mode, brief silence or no-speech is normal during pauses; keep listening
         } else if (event.error !== "aborted") {
-          setSpeechError("Voice recognition error. Please try again.");
+          console.warn("Speech recognition non-fatal error:", event.error);
         }
       };
 
       recognition.onend = () => {
-        setIsListening(false);
-        setInterimText("");
+        // If the browser closed recognition (e.g. silence timeout in Chrome) but user didn't press Stop, auto-restart
+        if (isListeningRef.current) {
+          try {
+            recognition.start();
+          } catch {
+            setTimeout(() => {
+              if (isListeningRef.current && recognitionRef.current) {
+                try {
+                  recognitionRef.current.start();
+                } catch {}
+              }
+            }, 250);
+          }
+        } else {
+          setIsListening(false);
+          setInterimText("");
+        }
       };
 
       recognitionRef.current = recognition;
+      isListeningRef.current = true;
       recognition.start();
     } catch (err: unknown) {
       console.error("Speech recognition startup error:", err);
-      setSpeechError("Unable to start speech recognition. Please try again.");
+      isListeningRef.current = false;
       setIsListening(false);
       setInterimText("");
+      setSpeechError("Unable to start speech recognition. Please try again.");
     }
   };
 
@@ -303,10 +350,10 @@ export function PromptForm({
             className="w-full resize-none border-0 bg-transparent p-1 text-base text-stone-900 placeholder:text-stone-400 focus:outline-hidden focus:ring-0 disabled:cursor-not-allowed disabled:opacity-60 leading-relaxed"
           />
 
-          {/* Prompt Controls Bar: Native SpeechRecognition & SpeechSynthesis */}
+          {/* Prompt Controls Bar: Continuous SpeechRecognition & SpeechSynthesis */}
           <div className="mt-2 flex flex-wrap items-center justify-between gap-2 border-t border-stone-100 pt-3">
             <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Speech controls">
-              {/* Native SpeechRecognition Button */}
+              {/* Native Continuous SpeechRecognition Button */}
               <button
                 type="button"
                 aria-label={isListening ? "Stop listening" : "Speak your prompt"}
@@ -321,7 +368,7 @@ export function PromptForm({
                 {isListening ? (
                   <>
                     <Square className="h-3.5 w-3.5 fill-current" />
-                    <span>Listening...</span>
+                    <span>Listening... Stop</span>
                   </>
                 ) : (
                   <>
